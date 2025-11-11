@@ -1,0 +1,225 @@
+mod handlers;
+mod types;
+
+use std::{collections::HashSet, env, net::SocketAddr, str::FromStr, sync::Arc};
+
+use axum::{
+    Router,
+    http::HeaderValue,
+    routing::{get, post},
+};
+use dotenv::dotenv;
+use reqwest::{Client as HttpClient, Method, header};
+use serenity::{
+    Client,
+    all::{ApplicationId, GatewayIntents},
+};
+use tokio::sync::RwLock;
+use tower_http::cors::CorsLayer;
+
+use crate::{
+    handlers::{
+        activity::{get_all_rooms, ws_handler},
+        auth::exchange_code_for_token,
+        event::{ping, play, voice_state_update},
+    },
+    types::{AppRoomState, AppState, Data, Error, Room, UserVoiceMap, VoiceChannelMap},
+};
+
+use poise::serenity_prelude::FullEvent::VoiceStateUpdate;
+
+async fn on_error(error: poise::FrameworkError<'_, Data, Error>) {
+    // This is our custom error handler
+    // They are many errors that can occur, so we only handle the ones we want to customize
+    // and forward the rest to the default handler
+    match error {
+        poise::FrameworkError::Setup { error, .. } => panic!("Failed to start bot: {:?}", error),
+        poise::FrameworkError::Command { error, ctx, .. } => {
+            println!("Error in command `{}`: {:?}", ctx.command().name, error,);
+        }
+        error => {
+            if let Err(e) = poise::builtins::on_error(error).await {
+                println!("Error while handling error: {}", e)
+            }
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    if let Ok(_path) = dotenv() {
+        println!("Loaded .env file");
+    } else {
+        println!("No .env file found, using system environment variables");
+    }
+    let token = env::var("DISCORD_BOT_TOKEN").expect("Expected a token in the environment");
+    let base_url = env::var("BASE_URL").expect("Expected base URL in environment");
+    let application_id = env::var("VITE_DISCORD_CLIENT_ID")
+        .expect("Expected application ID in environment")
+        .parse::<u64>()
+        .expect("Application ID must be a valid u64");
+
+    let intents = GatewayIntents::GUILD_MESSAGES
+        | GatewayIntents::MESSAGE_CONTENT
+        | GatewayIntents::GUILD_MEMBERS
+        | GatewayIntents::GUILD_VOICE_STATES
+        | GatewayIntents::GUILD_PRESENCES;
+
+    // Initialize shared data
+    let shared_data = Data {
+        application_id: ApplicationId::from(application_id),
+        voice_map: Arc::new(RwLock::new(VoiceChannelMap::default())),
+        user_voice_map: Arc::new(RwLock::new(UserVoiceMap::default())),
+        room_state: Arc::new(RwLock::new(AppRoomState::default())),
+    };
+
+    // Create dummy room
+    {
+        let dummy_room = Room {
+            room_id: "general_lobby_1".into(),
+            name: "Public Lobby".into(),
+            owner_id: "system".into(),
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+            max_capacity: 20,
+            members: HashSet::new(),
+        };
+
+        // Get a write lock and insert the room
+        // We can .await here because we are in an async fn
+        let mut room_state_write = shared_data.room_state.write().await;
+        room_state_write
+            .room_map
+            .insert(dummy_room.room_id.clone(), dummy_room);
+        println!("Created dummy 'Public Lobby' room.");
+    }
+
+    // Clone data for the monitoring task
+    let voice_map_monitor = shared_data.voice_map.clone();
+    let user_voice_map_monitor = shared_data.user_voice_map.clone();
+    let room_state_map_monitor = shared_data.room_state.clone();
+    // Poise Framework setup
+    let framework = poise::Framework::builder()
+        .options(poise::FrameworkOptions {
+            commands: vec![
+                play(),
+                ping(),
+                // add other commands here
+            ],
+            on_error: |error| Box::pin(on_error(error)),
+            event_handler: |ctx, event, _framework, data| {
+                Box::pin(async move {
+                    match event {
+                        VoiceStateUpdate { old, new } => {
+                            voice_state_update(ctx, old, new, data).await?;
+                        },
+                        _ => {}
+                    }
+                    Ok(())
+                })
+            },
+            ..Default::default()
+        })
+        .setup(|ctx, _ready, framework| {
+            Box::pin(async move {
+                // Get the first available guild from the cache
+                for guild_id in ctx.cache.guilds() {
+                    println!("Registering commands to guild {}...", guild_id);
+                    poise::builtins::register_in_guild(ctx, &framework.options().commands, guild_id).await?;
+                    println!("Commands registered to guild {} successfully!", guild_id);
+                }
+
+                if ctx.cache.guilds().is_empty() {
+                    println!("Bot is not in any guilds. Commands will not be registered until the bot joins a guild.");
+                }
+
+                Ok(shared_data)
+            })
+        })
+        .build();
+
+    let mut client = Client::builder(token, intents)
+        .framework(framework)
+        .await
+        .expect("Error creating client");
+
+    // Axum Setup
+    let app_state = Arc::new(AppState {
+        http_client: HttpClient::new(),
+        user_voice_map: user_voice_map_monitor.clone(),
+        room_state: room_state_map_monitor.clone(),
+    });
+
+    let addr = SocketAddr::from_str(base_url.as_str()).expect("Invalid base URL");
+
+    let cors_layer = CorsLayer::new()
+        .allow_origin("http://localhost:5173".parse::<HeaderValue>().unwrap())
+        .allow_headers([header::CONTENT_TYPE])
+        .allow_methods([Method::GET, Method::POST]);
+
+    let app = Router::new()
+        .route("/.proxy/api/token", post(exchange_code_for_token))
+        .route("/.proxy/api/activity/ws", get(ws_handler))
+        .route("/.proxy/api/activity/rooms", get(get_all_rooms))
+        .with_state(app_state)
+        .layer(cors_layer);
+
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .expect(&format!("Cannot bind to {}", addr.to_string()));
+
+    // Start Discord client
+    let discord_handle = tokio::spawn(async move {
+        println!("Starting Discord client...");
+        if let Err(why) = client.start().await {
+            println!("client error: {:?}", why);
+        }
+    });
+
+    // Voice state monitoring task
+    let voice_monitor = tokio::spawn(async move {
+        println!("Starting voice state monitor...");
+        loop {
+            {
+                let map_read = voice_map_monitor.read().await;
+                let user_map_read = user_voice_map_monitor.read().await;
+
+                if !map_read.map.is_empty() || !user_map_read.is_empty() {
+                    println!("Current VC Members:");
+
+                    for (guild_id, channels) in &map_read.map {
+                        for (channel_id, members) in channels {
+                            println!(
+                                "Guild {} | Channel {}: {:?}",
+                                guild_id.get(),
+                                channel_id.get(),
+                                members.iter().map(|f| f.get()).collect::<Vec<_>>()
+                            );
+                        }
+                    }
+
+                    println!(
+                        "User Voice Map: {:?}",
+                        user_map_read.keys().map(|k| k.get()).collect::<Vec<_>>()
+                    );
+                } else {
+                    println!("No active voice channels");
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        }
+    });
+
+    let http_server = axum::serve(listener, app);
+
+    tokio::select! {
+        result = discord_handle => {
+            println!("Discord client finished: {:?}", result);
+        },
+        result = http_server => {
+            println!("HTTP server finished: {:?}", result);
+        },
+        _ = voice_monitor => {
+            println!("Voice monitor finished");
+        }
+    }
+}
