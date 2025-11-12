@@ -1,7 +1,13 @@
 mod handlers;
 mod types;
 
-use std::{collections::HashSet, env, net::SocketAddr, str::FromStr, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    env,
+    net::SocketAddr,
+    str::FromStr,
+    sync::Arc,
+};
 
 use axum::{
     Router,
@@ -71,6 +77,7 @@ async fn main() {
         voice_map: Arc::new(RwLock::new(VoiceChannelMap::default())),
         user_voice_map: Arc::new(RwLock::new(UserVoiceMap::default())),
         room_state: Arc::new(RwLock::new(AppRoomState::default())),
+        room_broadcasters: Arc::new(RwLock::new(HashMap::new())),
     };
 
     // Create dummy room
@@ -97,6 +104,7 @@ async fn main() {
     let voice_map_monitor = shared_data.voice_map.clone();
     let user_voice_map_monitor = shared_data.user_voice_map.clone();
     let room_state_map_monitor = shared_data.room_state.clone();
+    let room_broadcasters_monitor = shared_data.room_broadcasters.clone();
     // Poise Framework setup
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
@@ -147,6 +155,7 @@ async fn main() {
         http_client: HttpClient::new(),
         user_voice_map: user_voice_map_monitor.clone(),
         room_state: room_state_map_monitor.clone(),
+        room_broadcasters: room_broadcasters_monitor.clone(),
     });
 
     let addr = SocketAddr::from_str(base_url.as_str()).expect("Invalid base URL");
@@ -202,7 +211,7 @@ async fn main() {
                         user_map_read.keys().map(|k| k.get()).collect::<Vec<_>>()
                     );
                 } else {
-                    println!("No active voice channels");
+                    // println!("No active voice channels");
                 }
             }
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;

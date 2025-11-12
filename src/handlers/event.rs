@@ -3,7 +3,8 @@ use std::collections::hash_map::Entry;
 use serenity::all::{CreateInvite, InviteTargetType};
 
 use crate::types::{
-    Data, Error, PoiseContext, SharedRoomState, UserIdStr, UserVoiceMap, VoiceChannelMap,
+    Data, Error, PoiseContext, Room, RoomBroadcaster, RoomSerialize, ServerMessage,
+    SharedRoomState, UserIdStr, UserVoiceMap, VoiceChannelMap,
 };
 use poise::serenity_prelude as serenity;
 
@@ -23,6 +24,7 @@ pub async fn voice_state_update(
     let mut voice_map = data.voice_map.write().await;
     let mut user_voice_map = data.user_voice_map.write().await;
     let room_state = data.room_state.clone();
+    let room_broadcasters = data.room_broadcasters.clone();
 
     // Handle user leaving a channel (from old state or our tracking)
     if let Some(old_state) = old {
@@ -31,6 +33,7 @@ pub async fn voice_state_update(
                 &mut voice_map,
                 &mut user_voice_map,
                 &room_state,
+                &room_broadcasters,
                 guild_id,
                 old_channel_id,
                 user_id,
@@ -43,6 +46,7 @@ pub async fn voice_state_update(
                 &mut voice_map,
                 &mut user_voice_map,
                 &room_state,
+                &room_broadcasters,
                 guild_id,
                 prev_channel_id,
                 user_id,
@@ -73,6 +77,7 @@ fn remove_user_from_voice_channel(
     voice_map: &mut VoiceChannelMap,
     user_voice_map: &mut UserVoiceMap,
     room_state: &SharedRoomState,
+    room_broadcasters: &RoomBroadcaster,
     guild_id: serenity::GuildId,
     channel_id: serenity::ChannelId,
     user_id: serenity::UserId,
@@ -99,6 +104,7 @@ fn remove_user_from_voice_channel(
 
     // Remove from activity map if present
     let room_state = room_state.clone();
+    let room_broadcasters = room_broadcasters.clone();
 
     // We spawn a new task to handle this so we don't block
     // the event handler with lock-in-lock awaits.
@@ -125,18 +131,33 @@ fn remove_user_from_voice_channel(
 
             match room_state.room_map.entry(room_id_clone) {
                 Entry::Occupied(mut entry) => {
-                    let room = entry.get_mut();
-                    // Remove the user from the room's members list
-                    room.members.remove(&user_id_str);
+                    {
+                        let room = entry.get_mut();
+                        // Remove the user from the room's members list
+                        room.members.remove(&user_id_str);
+                    }
+
+                    let room = entry.get();
                     println!(
                         "...removed user {} from room '{}'. {} members left.",
                         user_id,
                         room.name,
                         room.members.len()
                     );
+
+                    // broadcast
+                    let broadcasters = room_broadcasters.read().await;
+                    if let Some(tx) = broadcasters.get(entry.key()) {
+                        let serialized_room = RoomSerialize::from(room); // from &mut Room
+                        tx.send(ServerMessage::RoomState(serialized_room)).ok();
+                    }
+                    drop(broadcasters);
                     if room.members.is_empty() {
                         let room = entry.remove();
                         println!("...room '{}' is empty, deleting.", room.name);
+                        let mut broadcasters_write = room_broadcasters.write().await;
+                        broadcasters_write.remove(&room.room_id);
+                        println!("...deleting broadcaster for room '{}'", room.name);
                     }
                 }
                 Entry::Vacant(_) => {

@@ -4,9 +4,9 @@ use std::{
 };
 
 use reqwest::Client as ReqwestClient;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use serenity::all::{ApplicationId, ChannelId, GuildId, UserId};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, broadcast};
 
 // VOICE CHANNEL MAPPING AND EVENT HANDLER (CORE)
 
@@ -76,6 +76,12 @@ impl From<&Room> for RoomSerialize {
     }
 }
 
+impl AsRef<Room> for Room {
+    fn as_ref(&self) -> &Room {
+        self
+    }
+}
+
 #[derive(Default, Debug)]
 pub struct AppRoomState {
     /// Holds all active rooms, keyed by room_id
@@ -98,13 +104,16 @@ pub struct AppState {
     pub http_client: ReqwestClient,
     pub user_voice_map: Arc<RwLock<UserVoiceMap>>,
     pub room_state: SharedRoomState,
+    pub room_broadcasters: RoomBroadcaster,
 }
 
+pub type RoomBroadcaster = Arc<RwLock<HashMap<RoomId, broadcast::Sender<ServerMessage>>>>;
 pub struct Data {
     pub application_id: ApplicationId,
     pub voice_map: Arc<RwLock<VoiceChannelMap>>,
     pub user_voice_map: Arc<RwLock<UserVoiceMap>>,
     pub room_state: SharedRoomState,
+    pub room_broadcasters: RoomBroadcaster,
 }
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -149,11 +158,33 @@ pub enum ClientMessage {
     Ping,
 }
 
-#[derive(Serialize, Debug)]
+#[derive(Debug, Clone, Copy)]
+pub enum ServerSuccessCode {
+    Authenticated = 1,
+    RoomCreated = 2,
+    UserJoined = 3,
+    UserLeft = 4,
+    UserKicked = 5,
+}
+
+impl Serialize for ServerSuccessCode {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let value = *self as u8;
+        serializer.serialize_u8(value)
+    }
+}
+
+#[derive(Serialize, Debug, Clone)]
 #[serde(tag = "type")]
 pub enum ServerMessage {
     #[serde(rename = "success")]
-    Success { message: String },
+    Success {
+        message: String,
+        code: ServerSuccessCode,
+    },
     #[serde(rename = "error")]
     Error { message: String },
     #[serde(rename = "room_state")]
