@@ -1,5 +1,6 @@
 mod handlers;
 mod types;
+mod utils;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -18,21 +19,55 @@ use dotenv::dotenv;
 use reqwest::{Client as HttpClient, Method, header};
 use serenity::{
     Client,
-    all::{ApplicationId, GatewayIntents},
+    all::{ApplicationId, GatewayIntents, Ready, Settings},
 };
 use tokio::sync::RwLock;
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{Any, CorsLayer};
 
 use crate::{
     handlers::{
-        activity::{get_all_rooms, ws_handler},
+        activity::{create_room, get_all_rooms, join_room, spawn_room_cleanup_task, ws_handler},
         auth::exchange_code_for_token,
         event::{ping, play, voice_state_update},
     },
     types::{AppRoomState, AppState, Data, Error, Room, UserVoiceMap, VoiceChannelMap},
 };
-
 use poise::serenity_prelude::FullEvent::VoiceStateUpdate;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppEnv {
+    Development,
+    Production,
+}
+
+impl AppEnv {
+    fn from_env() -> Self {
+        match std::env::var("APP_ENV")
+            .unwrap_or_else(|_| "development".into())
+            .as_str()
+        {
+            "development" => AppEnv::Development,
+            "production" => AppEnv::Production,
+            _ => panic!("Invalid APP_ENV value"),
+        }
+    }
+}
+
+fn build_cors(env: AppEnv) -> CorsLayer {
+    match (env) {
+        AppEnv::Development => CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods(Any)
+            .allow_headers(Any),
+        AppEnv::Production => {
+            // This is a placeholder. TODO: Implement production CORS configuration
+            CorsLayer::new()
+                .allow_origin("https://example.com".parse::<HeaderValue>().unwrap())
+                .allow_methods([Method::GET, Method::POST])
+                .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
+        }
+    }
+}
 
 async fn on_error(error: poise::FrameworkError<'_, Data, Error>) {
     // This is our custom error handler
@@ -120,6 +155,10 @@ async fn main() {
                         VoiceStateUpdate { old, new } => {
                             voice_state_update(ctx, old, new, data).await?;
                         },
+                        serenity::all::FullEvent::Ready { data_about_bot } => {
+                            println!("Connected as {}", data_about_bot.user.name);
+                            scan_existing_voice_states(ctx, data).await;
+                        }
                         _ => {}
                     }
                     Ok(())
@@ -147,6 +186,15 @@ async fn main() {
 
     let mut client = Client::builder(token, intents)
         .framework(framework)
+        .cache_settings({
+            let mut settings = Settings::default();
+            // 2. Modify the specific fields you care about
+            settings.cache_guilds = true;
+            settings.cache_channels = true;
+            settings.cache_users = true;
+
+            settings
+        })
         .await
         .expect("Error creating client");
 
@@ -160,16 +208,16 @@ async fn main() {
 
     let addr = SocketAddr::from_str(base_url.as_str()).expect("Invalid base URL");
 
-    let cors_layer = CorsLayer::new()
-        .allow_origin("http://localhost:5173".parse::<HeaderValue>().unwrap())
-        .allow_headers([header::CONTENT_TYPE])
-        .allow_methods([Method::GET, Method::POST]);
+    let app_env = AppEnv::from_env();
+    let cors_layer = build_cors(app_env);
 
     let app = Router::new()
         .route("/.proxy/api/token", post(exchange_code_for_token))
         .route("/.proxy/api/activity/ws", get(ws_handler))
         .route("/.proxy/api/activity/rooms", get(get_all_rooms))
-        .with_state(app_state)
+        .route("/.proxy/api/activity/rooms", post(create_room))
+        .route("/.proxy/api/activity/rooms/join", post(join_room))
+        .with_state(app_state.clone())
         .layer(cors_layer);
 
     let listener = tokio::net::TcpListener::bind(addr)
@@ -220,6 +268,9 @@ async fn main() {
 
     let http_server = axum::serve(listener, app);
 
+    // room cleaner task
+    let room_cleanup_task = tokio::spawn(spawn_room_cleanup_task(app_state.clone()));
+
     tokio::select! {
         result = discord_handle => {
             println!("Discord client finished: {:?}", result);
@@ -229,6 +280,42 @@ async fn main() {
         },
         _ = voice_monitor => {
             println!("Voice monitor finished");
+        },
+        result = room_cleanup_task => {
+            println!("Room cleaner task finished: {:?}", result);
+        }
+    }
+}
+
+async fn scan_existing_voice_states(ctx: &serenity::all::Context, data: &Data) {
+    let mut voice_map = data.voice_map.write().await;
+    let mut user_voice_map = data.user_voice_map.write().await;
+    // let mut room_state = data.room_state.write().await; // Use if needed
+
+    println!("Scanning existing voice states...");
+
+    for guild_id in ctx.cache.guilds() {
+        if let Some(guild) = ctx.cache.guild(guild_id) {
+            for (user_id, voice_state) in &guild.voice_states {
+                if let Some(channel_id) = voice_state.channel_id {
+                    println!("User ID: {}", user_id.get());
+                    println!("Channel ID: {}", channel_id.get());
+                    voice_map
+                        .map
+                        .entry(guild_id)
+                        .or_default()
+                        .entry(channel_id)
+                        .or_default()
+                        .insert(*user_id);
+                    user_voice_map.insert(*user_id, (guild_id, channel_id));
+
+                    println!(
+                        "Detected user {} already in VC {} before startup",
+                        user_id.get(),
+                        channel_id.get()
+                    );
+                }
+            }
         }
     }
 }

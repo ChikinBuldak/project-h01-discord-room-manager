@@ -3,8 +3,10 @@ use std::{
     sync::Arc,
 };
 
-use reqwest::Client as ReqwestClient;
+use axum::{Json, response::IntoResponse};
+use reqwest::{Client as ReqwestClient, StatusCode};
 use serde::{Deserialize, Serialize, Serializer};
+use serde_json::json;
 use serenity::all::{ApplicationId, ChannelId, GuildId, UserId};
 use tokio::sync::{RwLock, broadcast};
 
@@ -40,15 +42,15 @@ pub struct DiscordTokenResponse {
 
 pub type UserIdStr = Arc<str>;
 
-#[derive(Clone, Debug)] // REMOVED Serialize
+#[derive(Clone, Debug)]
 pub struct Room {
     pub room_id: RoomId,
     pub name: Arc<str>,
-    pub owner_id: UserIdStr, // This is Arc<str>
+    pub owner_id: UserIdStr,
     pub created_at: String,
     pub max_capacity: usize,
     /// For members, it can use the format from user id discord, or general user id
-    pub members: HashSet<UserIdStr>, // This is HashSet<Arc<str>>
+    pub members: HashSet<UserIdStr>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -92,7 +94,6 @@ pub struct AppRoomState {
 
 pub type SharedRoomState = Arc<RwLock<AppRoomState>>;
 
-type GeneralUserId = String;
 pub type RoomId = Arc<str>;
 
 /**
@@ -123,9 +124,9 @@ pub type PoiseContext<'a> = poise::Context<'a, Data, Error>;
 
 /// This struct is used to parse the first message from the client
 /// over the WebSocket connection.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type")]
-pub enum WsAuthRequest {
+pub enum AuthInfoType {
     Discord {
         user_id: String,
         guild_id: String,
@@ -136,22 +137,12 @@ pub enum WsAuthRequest {
     },
 }
 
-#[derive(Deserialize, Debug)]
-pub struct WsCreateRoomRequest {
-    pub user_id: GeneralUserId,
-    pub room_id: String,
-    pub name: String,
-    pub created_at: String,
-    pub max_capacity: usize,
-}
 /// Message the client can send to the server *after* authentication
 #[derive(Deserialize, Debug)]
 #[serde(tag = "type")]
 pub enum ClientMessage {
-    #[serde(rename = "create_room")]
-    CreateRoom(WsCreateRoomRequest),
-    #[serde(rename = "join_room")]
-    JoinRoom { room_id: String },
+    #[serde(rename = "connect")]
+    Connect { auth: AuthInfoType, room_id: String },
     #[serde(rename = "leave_room")]
     LeaveRoom { room_id: String },
     #[serde(rename = "ping")]
@@ -161,10 +152,6 @@ pub enum ClientMessage {
 #[derive(Debug, Clone, Copy)]
 pub enum ServerSuccessCode {
     Authenticated = 1,
-    RoomCreated = 2,
-    UserJoined = 3,
-    UserLeft = 4,
-    UserKicked = 5,
 }
 
 impl Serialize for ServerSuccessCode {
@@ -180,15 +167,30 @@ impl Serialize for ServerSuccessCode {
 #[derive(Serialize, Debug, Clone)]
 #[serde(tag = "type")]
 pub enum ServerMessage {
-    #[serde(rename = "success")]
-    Success {
-        message: String,
-        code: ServerSuccessCode,
-    },
     #[serde(rename = "error")]
     Error { message: String },
     #[serde(rename = "room_state")]
     RoomState(RoomSerialize),
     #[serde(rename = "pong")]
     Pong,
+}
+
+// Global API Type
+
+#[derive(Debug, Clone)]
+pub struct ApiError {
+    pub status_code: StatusCode,
+    pub message: String,
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> axum::response::Response {
+        let body = Json(json!({
+            "error": true,
+            "code": self.status_code.as_u16(),
+            "message": self.message
+        }));
+
+        (self.status_code, body).into_response()
+    }
 }
