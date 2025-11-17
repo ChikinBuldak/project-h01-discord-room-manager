@@ -9,8 +9,7 @@ use axum::{
     response::Response,
 };
 use chrono::Utc;
-use futures_util::{SinkExt, StreamExt};
-use reqwest::StatusCode;
+use futures_util::{StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use serenity::all::{ChannelId, GuildId, UserId};
@@ -18,14 +17,14 @@ use tokio::{sync::broadcast, time::{Instant, sleep}};
 
 use crate::{
     types::{
-        ApiError, AppState, AuthInfoType, ClientMessage, Room, RoomId, RoomSerialize,
-        ServerMessage, ServerSuccessCode, UserIdStr,
+        AppState, AuthInfoType, ClientMessage, Room, RoomId, RoomSerialize,
+        ServerMessage, UserIdStr,
     },
     utils::generate_room_id,
 };
 
 /// How long an empty room can exist before being cleaned up.
-const ROOM_TTL: Duration = Duration::from_secs(300); // 5 minutes
+const ROOM_TTL: Duration = Duration::from_secs(5);
 /// How long a client can be silent before being disconnected.
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -63,84 +62,6 @@ impl From<&Room> for GetAllRoomsPayload {
     }
 }
 
-// User ID between General user and discord will be differentiated by
-// Discord: "discord-<actual_discord_user_id>" and "general-<user-id>"
-#[derive(Debug, Clone, Deserialize)]
-pub struct CreateRoomRequestPayload {
-    pub name: String,
-    pub max_capacity: usize,
-    pub auth: AuthInfoType,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct CreateRoomResponsePayload {
-    #[serde(rename = "type")]
-    pub response_type: String,
-    pub room_id: String,
-    pub owner_id: String,
-    pub name: String,
-    pub created_at: String,
-    pub max_capacity: usize,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct JoinRoomRequestPayload {
-    pub user_id: String,
-    pub room_id: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct JoinRoomResponsePayload {
-    #[serde(rename = "type")]
-    pub response_type: String,
-    pub room_id: String,
-    pub name: String,
-    pub owner_id: String,
-    pub created_at: String,
-    pub max_capacity: usize,
-    pub members: Vec<String>,
-}
-
-impl JoinRoomResponsePayload {
-    pub fn new(
-        room_id: String,
-        name: String,
-        owner_id: String,
-        created_at: String,
-        max_capacity: usize,
-        members: Vec<String>,
-    ) -> Self {
-        Self {
-            response_type: "join_room".to_string(),
-            room_id,
-            name,
-            owner_id,
-            created_at,
-            max_capacity,
-            members,
-        }
-    }
-}
-
-impl CreateRoomResponsePayload {
-    pub fn new(
-        room_id: String,
-        owner_id: String,
-        name: String,
-        created_at: String,
-        max_capacity: usize,
-    ) -> Self {
-        Self {
-            response_type: "create_room".to_string(),
-            room_id,
-            owner_id,
-            name,
-            created_at,
-            max_capacity,
-        }
-    }
-}
-
 // ================================================
 // ============= REST API HANDLERS=================
 // ================================================
@@ -155,179 +76,6 @@ pub async fn get_all_rooms(State(state): State<Arc<AppState>>) -> Json<Vec<GetAl
         .collect();
 
     Json(rooms)
-}
-
-pub async fn create_room(
-    State(state): State<Arc<AppState>>,
-    Json(payload): Json<CreateRoomRequestPayload>,
-) -> Result<Json<CreateRoomResponsePayload>, ApiError> {
-    // room ID will follow the established format. we can parse the request body
-    // general-XXXXXX or guild-XXXXXX_YYYYYYYY
-
-    // return variables
-    let name = payload.name;
-    let created_at = Utc::now().to_rfc3339();
-    let max_capacity: usize = payload.max_capacity;
-
-    let (room_id, user_id_gw): (Result<String, ApiError>, Option<Arc<str>>) = match payload.auth {
-        AuthInfoType::Discord {
-            user_id,
-            guild_id,
-            channel_id,
-        } => {
-            // validate user id
-            let arc = Arc::<str>::from(user_id.clone());
-            if user_id.starts_with("discord") {
-                (
-                    Ok(format!("discord-{}_{}", guild_id, channel_id)),
-                    Some(arc),
-                )
-            } else {
-                (
-                    Err(ApiError {
-                        status_code: StatusCode::BAD_REQUEST,
-                        message: "Invalid user ID format".to_string(),
-                    }),
-                    None,
-                )
-            }
-        }
-        AuthInfoType::General { user_id } => {
-            let arc = Arc::<str>::from(user_id.clone());
-            if user_id.starts_with("general") {
-                (Ok(format!("general-{}", generate_room_id())), Some(arc))
-            } else {
-                (
-                    Err(ApiError {
-                        status_code: StatusCode::BAD_REQUEST,
-                        message: "Invalid user ID format".to_string(),
-                    }),
-                    None,
-                )
-            }
-        }
-    };
-
-    let Some(user_id) = user_id_gw else {
-        return Err(ApiError {
-            status_code: StatusCode::BAD_REQUEST,
-            message: "Invalid user ID format".to_string(),
-        });
-    };
-
-    let mut room_state = state.room_state.write().await;
-
-    // Check if the user already in a room
-    if room_state.room_map.contains_key(&user_id) {
-        return Err(ApiError {
-            status_code: StatusCode::BAD_REQUEST,
-            message: "User already in a room".to_string(),
-        });
-    }
-
-    let room_id = room_id?;
-
-    // Check if room already exists
-    let room_id_arc: Arc<str> = room_id.clone().into();
-
-    if room_state.room_map.contains_key(&room_id_arc) {
-        return Err(ApiError {
-            status_code: StatusCode::BAD_REQUEST,
-            message: "Room already exists".to_string(),
-        });
-    }
-
-    let new_room = Room {
-        room_id: room_id_arc.clone(),
-        name: name.clone().into(),
-        owner_id: user_id.clone(),
-        created_at: created_at.clone(),
-        max_capacity: payload.max_capacity,
-        members: [user_id.clone()].iter().cloned().collect(),
-    };
-
-    room_state.room_map.insert(room_id_arc.clone(), new_room);
-    room_state
-        .user_map
-        .insert(user_id.clone(), room_id_arc.clone());
-
-    // Create broadcast for the room
-    let (tx, _) = broadcast::channel(16);
-    state
-        .room_broadcasters
-        .write()
-        .await
-        .insert(room_id_arc.clone(), tx);
-
-    println!("User {} created room {} with ID {}", user_id, name, room_id);
-
-    Ok(Json(CreateRoomResponsePayload::new(
-        room_id,
-        user_id.to_string(),
-        name,
-        created_at,
-        max_capacity,
-    )))
-}
-
-pub async fn join_room(
-    State(state): State<Arc<AppState>>,
-    Json(payload): Json<JoinRoomRequestPayload>,
-) -> Result<Json<JoinRoomResponsePayload>, ApiError> {
-    let user_id: Arc<str> = payload.user_id.into();
-    let room_id: Arc<str> = payload.room_id.into();
-
-    let mut room_state = state.room_state.write().await;
-
-    if room_state.user_map.contains_key(&user_id) {
-        return Err(ApiError {
-            status_code: StatusCode::BAD_REQUEST,
-            message: "User already in room".to_string(),
-        });
-    }
-
-    let room = {
-        let room_mut = room_state
-            .room_map
-            .get_mut(&room_id)
-            .ok_or_else(|| ApiError {
-                status_code: StatusCode::NOT_FOUND,
-                message: "Room not found".to_string(),
-            })?;
-
-        if room_mut.members.len() >= room_mut.max_capacity {
-            return Err(ApiError {
-                status_code: StatusCode::BAD_REQUEST,
-                message: "Room is full".to_string(),
-            });
-        }
-
-        // Add the new Users to the room
-        room_mut.members.insert(user_id.clone());
-
-        room_mut.clone()
-    };
-
-    room_state.user_map.insert(user_id.clone(), room_id.clone());
-
-    // Get broadcaster for futures real-time updates
-    let broadcaster = state.room_broadcasters.read().await;
-
-    if let Some(tx) = broadcaster.get(&room_id) {
-        let serialized_room = RoomSerialize::from(room.as_ref());
-        let _ = tx.send(ServerMessage::RoomState(serialized_room)).ok();
-    }
-
-    println!("User {} joined room {}", user_id, room_id);
-
-    Ok(Json(JoinRoomResponsePayload::new(
-        room.room_id.to_string(),
-        room.name.to_string(),
-        room.owner_id.to_string(),
-        room.created_at.clone(),
-        room.max_capacity,
-        room.members.iter().map(|id| id.to_string()).collect(),
-    )))
 }
 
 // ===============================================================
@@ -398,6 +146,7 @@ async fn handle_socket(mut ws: WebSocket, state: Arc<AppState>) {
                     }
                 };
 
+                // Logic for authenticated user
                 if user_id.is_some() {
                      match client_message {
                         ClientMessage::LeaveRoom { room_id } => {
@@ -422,6 +171,7 @@ async fn handle_socket(mut ws: WebSocket, state: Arc<AppState>) {
                     ClientMessage::Connect {auth, room_id} => {
                         println!("Received Connect request for room '{}'", room_id);
 
+                        // Validate AUTH
                         let validated_user_id = match validate_auth_info(auth, &state).await {
                             Ok(id) => id,
                             Err(msg) => {
@@ -432,7 +182,7 @@ async fn handle_socket(mut ws: WebSocket, state: Arc<AppState>) {
                                     },
                                 )
                                 .await;
-                                break; // Validation failed, close connection
+                                break;
                             }
                         };
 
@@ -523,6 +273,68 @@ async fn handle_socket(mut ws: WebSocket, state: Arc<AppState>) {
                         current_room_id = Some(room_id.into());
                         // Break the loop to trigger the cleanup logic
                         break;
+                    }
+                    ClientMessage::CreateRoom {auth, max_capacity, name} => {
+                        println!("Received CreateRoom request for '{}'", name);
+                            let validated_user_id = match validate_auth_info(auth.clone(), &state).await {
+                                Ok(id) => id,
+                                Err(msg) => {
+                                    send_message(&mut ws, ServerMessage::Error { message: msg }).await;
+                                    break;
+                                }
+                            };
+
+                            let (room_id_str, user_id_str): (String, Arc<str>) = match auth {
+                                AuthInfoType::Discord { guild_id, channel_id, .. } => 
+                                    (format!("discord-{}_{}", guild_id, channel_id), validated_user_id.clone()),
+                                AuthInfoType::General { .. } => 
+                                    (format!("general-{}", generate_room_id()), validated_user_id.clone()),
+                            };
+                            let room_id_arc: Arc<str> = room_id_str.into();
+                            let created_at = Utc::now().to_rfc3339();
+
+                            let mut room_state = state.room_state.write().await;
+                            
+                            if room_state.user_map.contains_key(&validated_user_id) {
+                                send_message(&mut ws, ServerMessage::Error { message: "User is already in a room.".to_string() }).await;
+                                break;
+                            }
+                            if room_state.room_map.contains_key(&room_id_arc) {
+                                 send_message(&mut ws, ServerMessage::Error { message: "Room already exists.".to_string() }).await;
+                                break;
+                            }
+                            
+                            let new_room = Room {
+                                room_id: room_id_arc.clone(),
+                                name: name.clone().into(),
+                                owner_id: user_id_str.clone(),
+                                created_at: created_at.clone(),
+                                max_capacity,
+                                members: [user_id_str.clone()].iter().cloned().collect(),
+                            };
+
+                            // 5. Update state
+                            room_state.room_map.insert(room_id_arc.clone(), new_room.clone());
+                            room_state.user_map.insert(user_id_str.clone(), room_id_arc.clone());
+                            
+                            // 6. Set session variables
+                            user_id = Some(user_id_str.clone());
+                            current_room_id = Some(room_id_arc.clone());
+                            
+                            // 7. Create broadcaster
+                            drop(room_state); // Drop write lock
+                            let mut broadcasters = state.room_broadcasters.write().await;
+                            let (tx, rx) = broadcast::channel(16);
+                            broadcasters.insert(room_id_arc.clone(), tx);
+                            current_broadcaster_sub = Some(rx);
+                            drop(broadcasters);
+
+                            // 8. Send success (RoomState)
+                            let serializable_room = RoomSerialize::from(&new_room);
+                            send_message(&mut ws, ServerMessage::RoomState(serializable_room)).await;
+
+                            println!("User {} created and joined room {} ({})", validated_user_id, name, room_id_arc);
+                        
                     }
                     ClientMessage::Ping => {
                         if user_id.is_none() {
@@ -661,78 +473,6 @@ async fn send_message(socket: &mut WebSocket, msg: ServerMessage) {
             _ => "message".to_string(),
         };
         println!("Failed to send {} to client", error_type);
-    }
-}
-
-async fn validate_connection(socket: &mut WebSocket, state: &Arc<AppState>) -> Option<UserIdStr> {
-    let auth_req_text = match socket.next().await {
-        Some(Ok(WsMessage::Text(text))) => text,
-        _ => {
-            println!("Client disconnected before sending auth message.");
-            return None;
-        }
-    };
-
-    let auth_req: AuthInfoType = match serde_json::from_str(&auth_req_text) {
-        Ok(req) => req,
-        Err(e) => {
-            send_message(
-                socket,
-                ServerMessage::Error {
-                    message: format!("Invalid auth message format: {}", e),
-                },
-            )
-            .await;
-            return None;
-        }
-    };
-
-    match auth_req {
-        AuthInfoType::Discord {
-            user_id,
-            guild_id,
-            channel_id,
-        } => {
-            let (user_id, guild_id, channel_id) = match (
-                user_id.parse::<u64>().ok().map(UserId::from),
-                guild_id.parse::<u64>().ok().map(GuildId::from),
-                channel_id.parse::<u64>().ok().map(ChannelId::from),
-            ) {
-                (Some(u), Some(g), Some(c)) => (u, g, c),
-                _ => {
-                    send_message(
-                        socket,
-                        ServerMessage::Error {
-                            message: "Invalid user, guild or channel ID".to_string(),
-                        },
-                    )
-                    .await;
-                    return None;
-                }
-            };
-
-            let is_valid = {
-                let user_voice_map = state.user_voice_map.read().await;
-                match user_voice_map.get(&user_id) {
-                    Some(&(g_id, c_id)) => g_id == guild_id && c_id == channel_id,
-                    None => false,
-                }
-            };
-
-            if is_valid {
-                Some(user_id.to_string().into())
-            } else {
-                send_message(
-                    socket,
-                    ServerMessage::Error {
-                        message: "Invalid voice channel".to_string(),
-                    },
-                )
-                .await;
-                None
-            }
-        }
-        AuthInfoType::General { user_id } => Some(user_id.into()),
     }
 }
 

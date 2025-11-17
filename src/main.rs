@@ -26,7 +26,7 @@ use tower_http::cors::{Any, CorsLayer};
 
 use crate::{
     handlers::{
-        activity::{create_room, get_all_rooms, join_room, spawn_room_cleanup_task, ws_handler},
+        activity::{get_all_rooms, spawn_room_cleanup_task, ws_handler},
         auth::exchange_code_for_token,
         event::{ping, play, voice_state_update},
     },
@@ -215,8 +215,6 @@ async fn main() {
         .route("/.proxy/api/token", post(exchange_code_for_token))
         .route("/.proxy/api/activity/ws", get(ws_handler))
         .route("/.proxy/api/activity/rooms", get(get_all_rooms))
-        .route("/.proxy/api/activity/rooms", post(create_room))
-        .route("/.proxy/api/activity/rooms/join", post(join_room))
         .with_state(app_state.clone())
         .layer(cors_layer);
 

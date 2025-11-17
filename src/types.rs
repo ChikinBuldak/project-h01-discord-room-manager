@@ -143,25 +143,12 @@ pub enum AuthInfoType {
 pub enum ClientMessage {
     #[serde(rename = "connect")]
     Connect { auth: AuthInfoType, room_id: String },
+    #[serde(rename = "create_room")]
+    CreateRoom {auth: AuthInfoType, max_capacity: usize, name: String},
     #[serde(rename = "leave_room")]
     LeaveRoom { room_id: String },
     #[serde(rename = "ping")]
     Ping,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum ServerSuccessCode {
-    Authenticated = 1,
-}
-
-impl Serialize for ServerSuccessCode {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let value = *self as u8;
-        serializer.serialize_u8(value)
-    }
 }
 
 #[derive(Serialize, Debug, Clone)]
